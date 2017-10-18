@@ -1,0 +1,788 @@
+---
+title: "Unsupervised techniques training"
+author: "AGPC"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    css : axa.css    
+    highlight: haddock
+    theme: cerulean
+    toc: true
+    toc_depth: 4
+
+---
+```{r set_options, echo = FALSE, cache = FALSE, include = FALSE}
+options(width = 110)
+```
+
+
+### Take away of the session
+- What are the issues when computing distance between observations
+  * text
+  * factors
+  * heterogeneous numerical variables (weight vs height)
+- key methods for clustering
+  * k-means to create k clusters
+  * DBSCAN to bag individuals based on density
+  * Ascendant hierarchical clustering to group observations based on a distance matrix
+  * Gaussian Mixture Model for fuzzy clustering
+- dimension reduction with Principal Component Analysis
+- outliers detection
+  * PCA + DBSCAN
+  * supervised methods on explanatory variables
+
+```{r echo=F, warning=F,message=F}
+set.seed(1337)
+library(data.table,quietly=T)
+library(bit64,quietly=T)
+library(Hmisc,quietly=T)
+library(caret,quietly=T)
+library(gbm,quietly=T)
+library(randomForest,quietly=T)
+library(foreach,quietly=T)
+library(FNN,quietly=T)
+library(mclust,quietly=T)
+library(leaflet,quietly=T)
+library(htmltools,quietly=T)
+library(dbscan,quietly=T)
+library(ggmap,quietly=T)
+library(ggplot2,quietly=T)
+library(apcluster,quietly=T)
+library(pbapply,quietly=T)
+library(ape,quietly=T)
+library(FactoMineR,quietly=T)
+library(rgl,quietly=T)
+```
+
+```{r echo=F, eval=F}
+load("full_expert_order_geolocation.RData")
+
+# names(claims)
+claims=full_expert_order_all
+claims$cost_number_sparep[is.na(claims$cost_number_sparep)]<-0
+claims=claims[!is.na(vehicle_sale_price)]
+
+
+
+claims=claims[,unique(c("cost_total","cost_discount","cost_excess","cost_number_sparep","cost_rep_mat","cost_rep_lab","cost_pt_mat","cost_pt_lab","hcost_rep_lab","vehicle_sale_price","distance_customer_offered_garage","distance_customer_garage",setdiff(keep,"check_repair_headlight"),"check_reapir_headlight",IDs,"garage_lon","garage_lat","claim_accident_date")),with=F]
+setnames(claims,"check_reapir_headlight","check_repair_headlight")
+save(list='claims',file="claims_data_training.RData")
+claims_sample=sample(claims)[1:100000]
+save(list='claims_sample',file="claims_data_training_sample.RData")
+```
+
+### What you will find in the CCA database `claims`
+
+This is an extract of car claims handled by AXA Seguros & Direct Seguros.
+
+We focus on 2014 claims.
+
+Each claim is identified with `claim_id`.
+
+Some claims are described on several rows and have a `multitask_id`.
+
+The other IDs are explicit : 
+
+- `policy_id` & `customer_id` differ by the underlying databases customer is related to the client, policy is related to the contract. Note that 20% of both policies & customers have more than one claim.
+- `mediator_id` & `garage_id` are the pivot the perform BI on both the bodyshop & the mediator. I suggest we focus on the bodyshop.
+
+
+
+The CCA aims at scoring bodyshops to offer agreement to the best ones and send each claim to the right bodyshop. For that we need to build features per bodyshop for the scoring : use the `garage_id`.
+
+
+
+First the target variables, related to cost.
+
+The most important one `cost_total` is the cost of the reparation, before tax & discount.
+
+This cost is split in several components : 
+- labor cost for reparation/replacement `cost_rep_lab`
+- labor cost for painting `cost_pt_lab`
+- cost of painting material `cost_pt_mat`
+- cost of spare parts `cost_rep_mat`
+
+these costs are completed by :
+- number of spare parts used in the reparation `cost_number_sparep`
+- the amount of the discount applied to the `cost_total` : `cost_discount`
+- the amount of the excess (participation of the insured in the cost of the claim) `cost_excess`
+- hourly cost of labour for reparation/replacement
+- hours of painting `time_lab_pt`
+- hours of labor for reparation/replacement `time_lab_rep`
+
+In addition we created so dummy variables related to specific spareparts needed for the reparation : 
+- headlight `check_repair_headlight`
+- door `check_repair_door`
+- front bumper `check_repair_frontbumper`
+- back bumper `check_repair_backbumper`
+- bonnet `check_repair_bonnet`
+- mudguard `check_repair_mudguard`
+
+Note that most spareparts are specific to a car brand, model & year + in the db the references and names are often wrong. Here we defined the features out of very generic spareparts.
+
+Severity of the claim is perhaps the most important feature to anticipate the cost of a claim.
+
+Unfortunately, nothing is filled in the database prior to the expert assessment.
+
+We know the information exist : think for instance about the location of damages, number of vehicles involved, circumstance of the claim, speed at the moment of the claim...
+
+Here is what we could find : 
+- guilt of the insured `claim_guilt`
+- involves a bodily injury ? `claim_injuries`
+- type of settlement : standard or convention between insurers `claim_solving`
+- guarantee affected : `coverage_affected_a`
+- type of claim : `claim_type`
+- channel for claim openning `expert_order_opening_channel`
+- was the vehicle replaced while the reparation ? `vehicle_replace`
+- did the bodyshop proceed to a pick up and delivery ? `vehicle_pnd`
+Other features can help anticipate the cost of the claim : 
+- sale cost of the vehicle `vehicle_sale_price`. A more insightful quantity is the value of the vehicle prior to the claim (adjusted with age, mileage, reparations, former claims, etc.), but we don't have it.
+- vehicle brand `vehicle_brand`
+- vehicle age `vehicle_age`
+One could also use date to compute : time UW to claim, claim to assessment & assessment to final payment of reparation or retrieval of the car
+
+Sometimes we either want to : 
+1) explain the gap between two types of claims
+2) or measure this gap
+think for instance of the agreed bodyshops `garage_tac` or the insurance entity `company`
+solutions are 
+1) build a predictive model strong enough to achieve good AUC, with the constraint of good interpretability.
+2) build a model interpretable, as much as possible, as "ceteris paribus". If you use GLM, use PLS to improve the consistency of the coefficients. Read the gap on the coefficient "ceteris paribus".
+
+In addition we also provide geolocation of both the bodyshop that repared the claim & the customer : `customer_lon`, `customer_lat`, `garage_lon`, `garage_lat`.
+
+With these for features we can build the euclidean distance from the bodyshop to the customer `distance_customer_garage`.
+
+As we know which bodyshop was recommended by AXA for the reparation, we also compute the distance from the customer to this bodyshop `distance_customer_offered_garage`.
+
+As cost also depends on the local situation, we provide `garage_postal_code`, the postal code of the bodyshop, to easily compute local indicators of cost.
+
+Though we strongly recommend to use k-NN based methods to build "local" features related to cost.
+
+
+
+```{r}
+load("claims_data_training.RData")
+```
+
+
+Unsupervised techniques
+
+# Geometry of the data & distance computation
+
+Geometry/topology of a dataset is a rich subject.
+In practice the first question one faces is : how do I get to compare factors, characters, booleans and numerics ?
+
+The tools for putting it all together are "metrics" or "distances" : 
+## distance between words (see text mining session)
+  * based on the spelling
+  * based on the semantic
+  * based on synthax
+## distance between numerical vectors : example with 2 variables. What is the distance between a 50 years old who earns 100k€ and a 30 years old who earns 30k€ ? Should we
+### Do nothing ?  
+- scatter plot
+```{r}
+load("full_expert_order_geolocation.RData")
+
+illustration=full_expert_order_all[,c("vehicle_sale_price","cost_number_sparep"),with=F]
+illustration=sample(na.omit(illustration))[1:1000]
+illustration$tag=c("A","B","C",rep(NA,997))
+ggplot(illustration,aes(x=cost_number_sparep,y=vehicle_sale_price,color=is.na(tag)))+geom_point()+geom_text(aes(label=tag),color="red",size=5)
+dist(illustration[!is.na(tag)][,c("vehicle_sale_price","cost_number_sparep"),with=F])
+```
+This is not intuitive, is it ?
+- density plot
+```{r}
+ggplot(illustration,aes(x=cost_number_sparep,y=vehicle_sale_price))+stat_density2d(aes(alpha=..level.., fill=..level..), size=2, bins=10, geom="polygon") + 
+    scale_fill_gradient(low = "yellow", high = "red") +
+    scale_alpha(range = c(0.00, 0.5), guide = FALSE) +
+    geom_density2d(colour="black") +
+    guides(alpha=FALSE)
+```
+### scale & center ?
+- scatter plot
+```{r}
+illustration2=preProcess(illustration,method=c("center","scale"))
+illustration2=predict(illustration2,illustration)
+ggplot(illustration2,aes(x=cost_number_sparep,y=vehicle_sale_price,color=is.na(tag)))+geom_point()+geom_text(aes(label=tag),color="red",size=5)+xlim(-1,2)+ylim(-2,3)
+dist(illustration2[!is.na(tag)][,c("vehicle_sale_price","cost_number_sparep"),with=F])
+```
+- density plot
+```{r}
+ggplot(illustration2,aes(x=cost_number_sparep,y=vehicle_sale_price))+stat_density2d(aes(alpha=..level.., fill=..level..), size=2, bins=10, geom="polygon") + 
+    scale_fill_gradient(low = "yellow", high = "red") +
+    scale_alpha(range = c(0.00, 0.5), guide = FALSE) +
+    geom_density2d(colour="black") +
+    guides(alpha=FALSE)+xlim(-1,2)+ylim(-2,3)
+```
+The scale has changed so the metrics are changed but it looks the same.
+### cap or remove extreme values 
+- scatter plot
+
+```{r}
+illustration2=illustration2[vehicle_sale_price%between%quantile(illustration2$vehicle_sale_price,c(0.025,0.975))]
+
+illustration2=illustration2[cost_number_sparep%between%quantile(illustration2$cost_number_sparep,c(0.025,0.975))]
+
+ggplot(illustration2,aes(x=cost_number_sparep,y=vehicle_sale_price,color=is.na(tag)))+geom_point()+geom_text(aes(label=tag),color="red",size=5)+xlim(-1,2)+ylim(-2,3)
+dist(illustration2[!is.na(tag)][,c("vehicle_sale_price","cost_number_sparep"),with=F])
+```
+
+- density plot
+```{r}
+
+ggplot(illustration2,aes(x=cost_number_sparep,y=vehicle_sale_price))+stat_density2d(aes(alpha=..level.., fill=..level..), size=2, bins=10, geom="polygon") + 
+    scale_fill_gradient(low = "yellow", high = "red") +
+    scale_alpha(range = c(0.00, 0.5), guide = FALSE) +
+    geom_density2d(colour="black") +
+    guides(alpha=FALSE)+xlim(-1,2)+ylim(-2,3)
+```
+### correct asymetry (skewness) and tails of the distribution (kurtosis)
+- scatter plot
+```{r}
+temp=illustration
+temp$vehicle_sale_price=log(temp$vehicle_sale_price)
+illustration2=preProcess(temp,method=c("center","scale"))
+illustration2=predict(illustration2,temp)
+ggplot(illustration2,aes(x=cost_number_sparep,y=vehicle_sale_price,color=is.na(tag)))+geom_point()+geom_text(aes(label=tag),color="red",size=5)+xlim(-1,2)+ylim(-2,3)
+dist(illustration2[!is.na(tag)][,c("vehicle_sale_price","cost_number_sparep"),with=F])
+```
+- density plot
+```{r}
+ggplot(illustration2,aes(x=cost_number_sparep,y=vehicle_sale_price))+stat_density2d(aes(alpha=..level.., fill=..level..), size=2, bins=10, geom="polygon") + 
+    scale_fill_gradient(low = "yellow", high = "red") +
+    scale_alpha(range = c(0.00, 0.5), guide = FALSE) +
+    geom_density2d(colour="black") +
+    guides(alpha=FALSE)+xlim(-1,2)+ylim(-2,3)
+  
+  
+```
+### apply ranking ie margin transformation to make the data uniform
+- scatter plot
+```{r}
+illustration2<-illustration
+illustration2$vehicle_sale_price=round(rank(illustration2$vehicle_sale_price))
+illustration2$vehicle_sale_price=illustration2$vehicle_sale_price/max(illustration2$vehicle_sale_price)
+illustration2$cost_number_sparep=round(rank(illustration2$cost_number_sparep))
+illustration2$cost_number_sparep=illustration2$cost_number_sparep/max(illustration2$cost_number_sparep)
+
+ggplot(illustration2,aes(x=cost_number_sparep,y=vehicle_sale_price,color=is.na(tag)))+geom_point()+geom_text(aes(label=tag),color="red",size=5)
+dist(illustration2[!is.na(tag)][,c("vehicle_sale_price","cost_number_sparep"),with=F])
+```
+- density plot
+```{r}
+ggplot(illustration2,aes(x=cost_number_sparep,y=vehicle_sale_price))+stat_density2d(aes(alpha=..level.., fill=..level..), size=2, bins=10, geom="polygon") + 
+    scale_fill_gradient(low = "yellow", high = "red") +
+    scale_alpha(range = c(0.00, 0.5), guide = FALSE) +
+    geom_density2d(colour="black") +
+    guides(alpha=FALSE)
+```
+
+Box-Cox power transformation provides a general framework for automatic selection of a convenient transformation to reshape the data.
+
+It can be applied using `preProcess()` function, with method `BoxCox` from the package  `caret` 
+
+http://www.isixsigma.com/tools-templates/normality/making-data-normal-using-box-cox-power-transformation/
+
+## distance between unordered factors
+What are the distances between car brand or claims types ?
+
+Are Audi, Toyota & Peugeot equidistant ?
+
+Contrary to numerical variables, with factors, we cannot think of intuitive distances.
+### GOWER metric using `daisy` function
+```{r}
+illustration=full_expert_order_all[,c("coverage_affected_a","vehicle_brand","cost_number_sparep","garage_tac"),with=F]
+illustration=sample(na.omit(illustration))[1:5]
+library(cluster)
+mix_metric=daisy(illustration,metric="gower")
+illustration
+mix_metric
+
+```
+- some methods, such as MCA are based on dissimilarity matrix ie hardcoding each factor using n-1 dummy variables for a n-values factor.
+- another idea is to create numerical features using the factors as pivots. For instance : average value of the cars per brand, average cost of reparation per brand, orientation per brand... Anything we would like to test.
+  
+
+# Methods for clustering
+
+load data for toy examples (same data as for supervised)
+```{r}
+load("toy_datasets.RData")
+linear=rbind(linear_test,linear_train)
+saturn=rbind(saturn_test,saturn_train)
+moon=rbind(moon_test,moon_train)
+```
+
+## k-means
+
+### theory
+k-means (look at the last one to open on density based algo)
+http://www.onmyphd.com/?p=k-means.clustering&ckattempt=1
+
+
+k-medoids (more sophisticated than k-means but much slower)
+https://www.youtube.com/watch?v=osjd5eV4ypA
+
+Not many parameters.
+
+When used for classification, k is tuned to minimize the error rate, thus train & test become important as a calibration is done based on a target.
+
+Otherwise, the parameter is tuned to fit intuitions or visual compliance (see geo-clustering)
+
+### application on a toy example
+
+```{r}
+linear$kmeans=kmeans(linear[,c("X1","X2"),with=F],centers = 2)$cluster
+ggplot(data=linear,aes(x=X1,y=X2,color=factor(kmeans),shape=factor(Target)))+geom_point()
+
+k=5
+moon$kmeans=kmeans(moon[,c("X1","X2"),with=F],centers = k)$cluster
+moon[,list(group1=mean(Target==1),group2=mean(Target==0),volume=.N),by=kmeans]
+ggplot(data=moon,aes(x=X1,y=X2,color=factor(kmeans),shape=factor(Target)))+geom_point(size=3)
+
+k=8
+saturn$kmeans=kmeans(saturn[,c("X1","X2"),with=F],centers = k)$cluster
+saturn[,list(group1=mean(Target==1),group2=mean(Target==0),volume=.N),by=kmeans]
+ggplot(data=saturn,aes(x=X1,y=X2,color=factor(kmeans),shape=factor(Target)))+geom_point()
+
+```
+Load the map backend using google API
+```{r eval=F}
+g<-qmap("Spain",maptype="roadmap",zoom=7)
+save(list="g",file="map_spain.RData")
+```
+
+### Application to geoclustering
+```{r}
+load("map_spain.RData")
+load("claims_data_training.RData")
+claims[,c("garage_volume"):=list(.N),by="garage_id"]
+location=unique(claims[garage_volume>10][,c("garage_id","garage_lon","garage_lat"),with=F])
+cluster_kmeans=kmeans(location[,c("garage_lon","garage_lat"),with=F],centers = 10)
+location$cluster=factor(cluster_kmeans$cluster)
+
+hulls <- location[, .SD[chull(garage_lon, garage_lat)], by = cluster]
+hulls <- hulls[cluster != "0",]
+
+g+geom_point(data=location[!cluster=="0"],aes(x=garage_lon,y=garage_lat,color=cluster))+geom_polygon(data = hulls, aes(x=garage_lon,y=garage_lat,fill = cluster, group = cluster),alpha = 0.5, color = NA) 
+
+```
+Lots of outliers. 
+Is it a problem ? 
+Or does it mean that outliers are isolated bodyshops that can't be substituted ?
+
+## density based clustering - DBSCAN (& OPTICS)
+### theory
+visual example & illustration of the method
+
+http://www.cse.buffalo.edu/~jing/cse601/fa12/materials/clustering_density.pdf
+
+define the epsilon radius & the minimum number of point within the radius.
+
+If a point hasn't enough points in the neighborhood, it's considered an outlier.
+
+The limit of dbscan is when the local density is heterogeneous (slide 15/16)
+
+It sounds consistent because it's based on the density of points. It fits visual interpretation of "bags" of points
+
+It's possible to tune it smartly with k-nearest neighbor distance where k is the "min-points" parameter.
+
+This is done in the subsection related to PCA & outliers removal on the claims database (PCA+DBSCAN)
+
+For a dbscan, only one epsilon (radius) is being used, but the clustering can be iterated : 
+1) define a list of epsilon for which you want to create cluster (k-nn dist distribution & quantiles might be insightful)
+2) start with the smallest epsilon
+3) the cluster 0 stands for "not clustered" (outliers), run the next dbscan (next epsilon) on these.
+
+step 3 needs to be iterated with each epsilon from the smallest to the highest.
+
+### application on a toy example
+
+```{r}
+load("toy_datasets.RData")
+linear=rbind(linear_test,linear_train)
+saturn=rbind(saturn_test,saturn_train)
+moon=rbind(moon_test,moon_train)
+```
+
+```{r}
+linear$dbscan=dbscan(linear[,c("X1","X2"),with=F],eps = 0.05,minPts = 10)$cluster
+ggplot(data=linear,aes(x=X1,y=X2,color=factor(dbscan),shape=factor(Target)))+geom_point()
+# try with eps 0.05, 0.15 (good), 0.3.
+# Notice that the outliers are quite consistent, they are the "misclassified"
+moon$dbscan=dbscan(moon[,c("X1","X2"),with=F],eps = 0.15,minPts = 50)$cluster
+moon[,list(group1=mean(Target==1),group2=mean(Target==0),volume=.N),by=dbscan]
+ggplot(data=moon,aes(x=X1,y=X2,color=factor(dbscan),shape=factor(Target)))+geom_point()
+# try with eps 1, 2 (good, no outiers), 5.
+saturn$dbscan=dbscan(saturn[,c("X1","X2"),with=F],eps = 2,minPts = 10)$cluster
+saturn[,list(group1=mean(Target==1),group2=mean(Target==0),volume=.N),by=dbscan]
+ggplot(data=saturn,aes(x=X1,y=X2,color=factor(dbscan),shape=factor(Target)))+geom_point()
+
+```
+
+In the end we had to accept duplication of clusters to get a good classification when our eyes tell us there are 2 clusters only.
+
+
+### Application to geoclustering
+```{r}
+load("bodyshop_geoclust.RData")
+load("map_spain.RData")
+claims[,c("garage_volume"):=list(.N),by="garage_id"]
+location=unique(claims[garage_volume>10][,c("garage_id","garage_lon","garage_lat"),with=F])
+cluster_dbscan=dbscan(location[,c("garage_lon","garage_lat"),with=F],eps = 0.3,minPts = 20,borderPoints = TRUE,search = "kdtree",splitRule = "SUGGEST")
+location$cluster=factor(cluster_dbscan$cluster)
+
+hulls <- location[, .SD[chull(garage_lon, garage_lat)], by = cluster]
+hulls <- hulls[cluster != "0",]
+
+g+geom_point(data=location[!cluster=="0"],aes(x=garage_lon,y=garage_lat,color=cluster))+geom_polygon(data = hulls, aes(x=garage_lon,y=garage_lat,fill = cluster, group = cluster),alpha = 0.5, color = NA) 
+
+```
+
+
+
+## Mixture models & fuzzy clustering
+
+consistent example on data
+(Gaussian) Mixture Clustering
+http://www.autonlab.org/tutorials/gmm14.pdf
+check slides 21-24
+
+### application on a toy example (different from linear/moon/saturn)
+
+```{r}
+x1<-rnorm(n = 100,mean = 0,sd = .4)
+y1<-rnorm(n = 100,mean = 0,sd = .4)
+x2<-rnorm(n = 50,mean = 1,sd = .8)
+y2<-rnorm(n = 50,mean = 2,sd = .8)
+x3<-rnorm(n = 200,mean = 3,sd = .4)
+y3<-rnorm(n = 200,mean = 0,sd = .8)
+db=data.table(x=c(x1,x2,x3),y=c(y1,y2,y3),belong=c(rep(1,100),rep(2,50),rep(3,200)))
+
+ggplot(data=db,aes(x=x,y=y,color=factor(belong)))+geom_point()
+clust=Mclust(db,G=3)
+cluster=apply(clust$z,1,which.max)
+db$cluster=factor(cluster)
+ggplot(data=db,aes(x=x,y=y,color=factor(cluster),shape=factor(belong)))+geom_point(size=3)
+# classification quality
+db[,list(mean(cluster==1),mean(cluster==2),mean(cluster==3)),by=belong]
+```
+
+### Application to geoclustering
+
+```{r eval=F}
+load("map_spain.RData")
+cluster_Mclust=Mclust(location[,c("garage_lon","garage_lat"),with=F],control = emControl(tol=1.e-6),warn = TRUE,G=1:20)
+summary(cluster_Mclust)
+save(list="cluster_Mclust",file="Mclust.RData")
+```
+
+Assign to the main cluster & visualize
+
+```{r}
+load("Mclust.RData")
+cluster=cluster_Mclust$z
+cluster[cluster<0.1]=0
+
+cluster=apply(cluster,1,which.max)
+location$cluster=factor(cluster)
+
+hulls <- location[, .SD[chull(garage_lon, garage_lat)], by = cluster]
+hulls <- hulls[cluster != "0",]
+
+load("map_spain.RData")
+g+geom_point(data=location[!cluster=="0"],aes(x=garage_lon,y=garage_lat,color=cluster))+geom_polygon(data = hulls, aes(x=garage_lon,y=garage_lat,fill = cluster, group = cluster),alpha = 0.5, color = NA) 
+
+```
+
+### why fuzzy ? how to use the proba
+
+when the points overlap and classification is really uncertain (we lack information to properly split the data)
+
+```{r}
+x1<-rnorm(n = 100,mean = 0,sd = .5)
+y1<-rnorm(n = 100,mean = 0,sd = .5)
+z1<-rnorm(n = 100,mean = 0,sd = .5)
+x2<-rnorm(n = 50,mean = 1,sd = 1)
+y2<-rnorm(n = 50,mean = 2,sd = 1)
+z2<-rnorm(n = 50,mean = 10,sd = 1)
+x3<-rnorm(n = 200,mean = 3,sd = .5)
+y3<-rnorm(n = 200,mean = 0,sd = 1)
+z3<-rnorm(n = 200,mean = -10,sd = 1)
+example=data.table(x=c(x1,x2,x3),y=c(y1,y2,y3),z=c(z1,z2,z3),belong=c(rep(1,100),rep(2,50),rep(3,200)))
+
+ggplot(example,aes(x=x,y=y,color=factor(belong)))+geom_point()
+plot3d(example[,c("x","y","z"),with=F],col = factor(example$belong))
+
+
+```
+Imagine we only observe x & y and what to do the most consistent classification. fuzzy clustering looks better than previous methods for this application.
+
+If you think of the claims clustering problem or bodyshop clustering, probabilities can be used to compute more sophisticated discrepancy amongst observations based on the fuzzy clustering only.
+
+It can be seen as a tool for dimension reduction, like PCA.
+
+### limit : Useless for complicated shapes - toy examples
+```{r}
+
+linear$Mclust=factor(apply(Mclust(linear[,c("X1","X2"),with=F])$z,1,which.max))
+ggplot(data=linear,aes(x=X1,y=X2,color=factor(Mclust),shape=factor(Target)))+geom_point()
+
+moon$Mclust=factor(apply(Mclust(moon[,c("X1","X2"),with=F])$z,1,which.max))
+moon[,list(group1=mean(Target==1),group2=mean(Target==0),volume=.N),by=Mclust]
+ggplot(data=moon,aes(x=X1,y=X2,color=factor(Mclust),shape=factor(Target)))+geom_point()
+
+saturn$Mclust=factor(apply(Mclust(saturn[,c("X1","X2"),with=F],G=1:20)$z,1,which.max))
+saturn[,list(group1=mean(Target==1),group2=mean(Target==0),volume=.N),by=Mclust]
+ggplot(data=saturn,aes(x=X1,y=X2,color=factor(Mclust),shape=factor(Target)))+geom_point()
+
+```
+
+
+## Digression related to these toy datasets - KNN for unsupervised classification
+
+```{r}
+k=10
+knn=get.knn(linear[,c("X1","X2"),with=F],k=k)$nn.index
+
+linear$knn=rowSums(t(apply(knn,1,function(x)linear$Target[x])))/k
+ggplot(data=linear,aes(x=X1,y=X2,color=factor(knn),shape=factor(Target)))+geom_point()
+k=10
+knn=get.knn(moon[,c("X1","X2"),with=F],k=k)$nn.index
+moon$knn=round(rowSums(t(apply(knn,1,function(x)moon$Target[x])))/k)
+moon[,list(group1=mean(Target==1),group2=mean(Target==0),volume=.N),by=knn]
+ggplot(data=moon,aes(x=X1,y=X2,color=factor(knn),shape=factor(Target)))+geom_point()
+k=20
+knn=get.knn(saturn[,c("X1","X2"),with=F],k=k)$nn.index
+saturn$knn=round(rowSums(t(apply(knn,1,function(x)saturn$Target[x])))/k)
+saturn[,list(group1=mean(Target==1),group2=mean(Target==0),volume=.N),by=knn]
+ggplot(data=saturn,aes(x=X1,y=X2,color=factor(knn),shape=factor(Target)))+geom_point()
+
+```
+
+
+
+
+## PCA for dimension reduction
+### theory 
+- dimension (variables) reduction 
+- fix issue of high correlation amongst variables
+- PCA is not some black box method, there are metrics and visual tools to understand the components (eigen vectors)
+Rebalancing the axis to get more insight focusing on the first principal components http://setosa.io/ev/principal-component-analysis/
+- it's basis for visualization as we see in the next example on Hierarchical Clustering
+  + thus one can check the shape of the cluster
+  + but also identify the location of the outliers
+- other applications
+  + Partial Least Squares is a GLM based on PCA main components
+  + rotation trees & rotation forests use PCA first component, which is different each time the variables and observations are sampled
+  
+http://factominer.free.fr/classical-methods/principal-components-analysis.html
+
+### basis for visualization - example of outliers cleaning
+
+```{r}
+brands=full_expert_order_all[,list(cost_avg=mean(vehicle_sale_price,na.rm=T),cost_q.8=quantile(vehicle_sale_price,.8,na.rm=T),age_avg=mean(vehicle_age,na.rm=T),age_q.8=quantile(vehicle_age,.8,na.rm=T),volume=.N),by=vehicle_brand]
+process=preProcess(brands,method=c("center","scale","BoxCox","pca"))
+brands_processed=predict(process,brands)
+```
+
+
+```{r}
+load("claims_data_training.RData")
+db=claims[,c("cost_total","cost_discount","cost_excess","cost_number_sparep","cost_pt_mat","cost_pt_lab","hcost_rep_lab","vehicle_sale_price","distance_customer_offered_garage","distance_customer_garage","garage_tac"),with=F]
+res.pca <- PCA(db, quanti.sup = 1, quali.sup = 11,scale.unit=TRUE)
+plot(res.pca, choix="var")
+dimdesc(res.pca,axes=1:2)
+
+## Selection of some individuals
+plot(res.pca,select="contrib 100") #plot the 100 individuals that have the highest cos2 
+
+db_pca=data.table(res.pca$ind$coord[,1:2])
+setnames(db_pca,names(db_pca),c("PC1","PC2"))
+
+ggplot(data=sample(db_pca)[1:10000],aes(x=PC1,y=PC2))+geom_point()
+
+```
+
+### deep dive into DBSCAN tuning - example of outliers cleaning 
+
+```{r warning=F}
+# Calibration of the parameters of DBSCAN using k_dist plot
+KNN=get.knn(data = sample(db_pca)[1:10000],k=100)$nn.dist[,c(1:10*10)]
+k_dist=c(apply(KNN,2,function(x)quantile(x,1:90/100)))
+k_dist=data.table(x=rep(1:90,10),k_dist,k=sort(rep(1:10*10,90)))
+g<-ggplot(data=k_dist,aes(x=x,y=k_dist,color=factor(k)))+geom_line()
+g
+# http://stackoverflow.com/questions/12893492/choosing-eps-and-minpts-for-dbscan-r
+
+
+# tuning the parameters of DBSCAN to find the cluster structure we prefer
+# grid=expand.grid(eps=1:10*3/100,minPts=c(50,100,500),method=c("kdtree","linear"),split=c("STD","MIDPT","FAIR","SL_MIDPT","SL_FAIR","SUGGEST"))
+grid=expand.grid(eps=1:30/100,minPts=c(50),method=c("kdtree"),split=c("SUGGEST"))
+extract=sample(db_pca)[1:25000]
+tune=pbapply(grid,1,function(x){
+  table(dbscan(x = extract,eps = x[1],minPts = x[2],search=x[3],splitRule = x[4])$cluster)
+})
+
+tune
+```
+
+```{r}
+# first iteration 
+outliers=dbscan(extract,eps=0.5,minPts = 500)
+table(outliers$cluster)
+extract$cluster=outliers$cluster
+ggplot(data=extract,aes(x=PC1,y=PC2,color=factor(cluster)))+geom_point()
+
+# second iteration
+extract_2=extract[cluster==0]
+outliers=dbscan(extract_2,eps=1,minPts = 100)
+table(outliers$cluster)
+extract_2$cluster=outliers$cluster
+ggplot(data=extract_2,aes(x=PC1,y=PC2,color=factor(cluster)))+geom_point()
+
+# second iteration
+extract_3=extract_2[cluster==0]
+outliers=dbscan(extract_3,eps=2,minPts = 50)
+table(outliers$cluster)
+extract_3$cluster=outliers$cluster
+ggplot(data=extract_3,aes(x=PC1,y=PC2,color=factor(cluster)))+geom_point()
+
+# now removes these 0.2% outliers.
+
+
+
+# You can check the derived & improved methods : OPTICS
+```
+
+## Additional content related to outliers
+
+SOME THEORY : 
+
+"An outlier is an observation that appears to deviate markedly from other observations in the sample."
+Outliers are important for the following reasons : 
+- indicate bad data quality and potential errors of records
+- suspicious claims that are potential fraud
+- exceptionnal cases such as claims to trial or very expensive cars
+- extreme values such as bodily injury
+
+Iglewicz & Hoaglin define 3 issues regarding outliers : 
+- labeling/tagging for further investigation
+- accomodation : use techniques robust to ouliers
+- identification using formal test
+
+The statistical approach for outliers detection are related to the normality assumption.
+Therefore, most outliers tests are based on the criterion of distance from the mean : 
+- Grubbs' test for single outlier detection
+- Tietjen-Moore test for precise k outliers detection
+- Generalized Extreme Studentized Deviate Test for at most k outliers
+
+
+IN PRACTICE - another method for outlier detection & removing : 
+
+A proper way to do it is to normalize (build a predictive model on) each variable with the others, assess CI, compare prediction & real value, then remove X% outliers.
+
+For instance, say you want to remove the claims where the car has an abnormal sale price considering the vehicle caracteristics.
+
+```{r}
+car_price=full_expert_order_all[,names(full_expert_order_all)[grep("vehicle",names(full_expert_order_all))],with=F]
+car_price=car_price[!is.na(vehicle_sale_price)]
+```
+split in A & B : 
+- first train on A to predict on B and remove B outliers.
+- then train on B and predict on A and remove A outliers
+
+```{r}
+
+half_sample=sample(1:nrow(car_price),size=round(.5*nrow(car_price)))
+param=c(shrinkage=0.03,depth=20,trees=200)
+system.time(gb<-gbm(vehicle_sale_price~.,data = car_price[half_sample],shrinkage = param[1],interaction.depth = param[2],n.trees = param[3],train.fraction=0.8,bag.fraction=0.5,verbose = T))
+error=abs(car_price[-half_sample]$vehicle_sale_price-predict(gb,car_price[-half_sample]))/predict(gb,car_price[-half_sample])
+#if you want to remove the 1% outliers : 
+selectA=which(error>quantile(error,.99))
+#if you'd rather define an intuitive threshold looking at the data :
+quantile(error,0:100/100)
+#let's say 50% error is really too big
+selectA=which(error>.5)
+# and you can actually look at the abnormal data
+head(car_price[-half_sample][order(error,decreasing=T)])
+
+
+
+system.time(gb<-gbm(vehicle_sale_price~.,data = car_price[-half_sample],shrinkage = param[1],interaction.depth = param[2],n.trees = param[3],train.fraction=0.8,bag.fraction=0.5,verbose = T))
+error=abs(car_price[half_sample]$vehicle_sale_price-predict(gb,car_price[half_sample]))/predict(gb,car_price[half_sample])
+quantile(error,0:100/100)
+selectB=which(error>.5)
+
+# then keep only the non outliers : 
+car_price=rbind(car_price[setdiff(half_sample,selectB)],car_price[-half_sample][-selectA])
+
+
+
+```
+
+See the methods for CI computations in the scoring section to have more insight on the feasability in a more sophisticated way.
+
+
+
+
+
+## H-clust & distance computation
+A LITTLE THEORY : 
+
+compute a distance between observation.
+http://www.analytictech.com/networks/hiclus.htm
+
+Given a set of N items to be clustered, and an NxN distance (or similarity) matrix, the basic process of 
+Johnson's (1967) hierarchical clustering is this:
+
+1) Start by assigning each item to its own cluster, so that if you have N items, you now have N clusters, each containing just one item. Let the distances (similarities) between the clusters equal the distances (similarities) between the items they contain.
+2) Find the closest (most similar) pair of clusters and merge them into a single cluster, so that now you have one less cluster.
+3) Compute distances (similarities) between the new cluster and each of the old clusters.
+4) Repeat steps 2 and 3 until all items are clustered into a single cluster of size N.
+
+The question is, when assigning singleton to clusters, what metric should be used ?
+- minimum distance to points of the cluster
+- median distance to points of the cluster
+- distance to the medoid of the cluster
+- maximum distance to points of the cluster
+
+APPLICATIONS 
+
+See the plots & cut the tree (hierarchy) + viz with PCA
+
+Application to geoclustering
+```{r}
+load("map_spain.RData")
+
+cluster_hierchical=hclust(dist(location[,c("garage_lon","garage_lat"),with=F]))
+
+plot(as.phylo(cluster_hierchical),type="fan",cex=0.5)
+memb<-cutree(cluster_hierchical,k=25)
+
+location$cluster=factor(memb)
+
+hulls <- location[, .SD[chull(garage_lon, garage_lat)], by = cluster]
+hulls <- hulls[cluster != "0",]
+
+g+geom_point(data=location[!cluster=="0"],aes(x=garage_lon,y=garage_lat,color=cluster))+geom_polygon(data = hulls, aes(x=garage_lon,y=garage_lat,fill = cluster, group = cluster),alpha = 0.5, color = NA) 
+
+```
+
+Application to brand classification
+```{r}
+cluster_hierchical=hclust(dist(brands_processed[,c("PC1","PC2","PC3"),with=F]))
+plot(cluster_hierchical,labels =brands_processed$vehicle_brand)
+memb<-cutree(cluster_hierchical,k=5)
+
+brands_processed$hcluster=factor(memb)
+brands_processed[,list(paste(vehicle_brand,collapse=",")),by=hcluster]
+```
+
+Visualization using PCA
+```{r}
+hulls <- brands_processed[, .SD[chull(PC1,PC2)], by = hcluster]
+ggplot()+geom_point(data=brands_processed,aes(x=PC1,y=PC2,color=hcluster))+geom_polygon(data = hulls, aes(x=PC1,y=PC2,fill = hcluster, group = hcluster),alpha = 0.5, color = NA)+geom_text(data=brands_processed,aes(x=PC1,y=PC2,label=vehicle_brand,color=hcluster))
+
+```
